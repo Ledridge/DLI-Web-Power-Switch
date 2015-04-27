@@ -1,0 +1,12 @@
+This file is presended courtey of Nickolas Moser.
+
+Users:
+To properly compile and execute, it requires the HttpClient library from
+Apache to be in the classpath. It can be found here:
+http://hc.apache.org/downloads.cgi
+I downloaded version 4.03, the Binary with Dependencies, but I believe
+any 4.x version should work. HttpClient 3.x versions will not work, as
+the API is different.
+
+Thanks,
+Nick

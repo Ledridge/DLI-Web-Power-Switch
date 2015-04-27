@@ -1,0 +1,908 @@
+//---------------------------------------------------------------------------
+//	DLI Example Ethernet Power Controller switching program
+//  Requires: Borland RAD Studio 2007
+//            Indy v10.0 Indy free and is available free from http://www.indyproject.org/.
+// I have not written the code to reset all settings on the EPCR
+//
+// 7/12/08 Added EPCR2 - V1.2.9 compatibailty
+//
+// Michael Gillen, Digital Loggers, Inc.
+//
+//---------------------------------------------------------------------------
+#include <vcl.h>
+#include <Registry.hpp>
+#pragma hdrstop
+#include <IdMultipartFormData.hpp>
+#include "Main.h"
+#include "HourGlass.h"
+//---------------------------------------------------------------------------
+#pragma package(smart_init)
+#pragma resource "*.dfm"
+
+
+#define SAVE_PASSWORD
+#define CONNECT_TIMEOUT 5000
+
+#define BASE_KEY "Software\\Digital Loggers, Inc.\\EPC Switcher"
+enum EpcTypes
+{
+	epcUNKNOWN, epcEPCR, epcLPC, epcEPCR2
+} ;
+EpcTypes EpcType;
+
+
+TForm1 *Form1;
+//---------------------------------------------------------------------------
+// Constructor
+//---------------------------------------------------------------------------
+__fastcall TForm1::TForm1(TComponent* Owner)
+: TForm(Owner)
+{
+	// Retreive settings from the registry
+	EpcType = epcUNKNOWN;
+	LoadSettings();
+	DisableButtons();
+  PostMessage( this->Handle, CM_APPSTART, 0, 0 );
+}
+//---------------------------------------------------------------------------
+// The Application is constructed and is now processing messages
+//---------------------------------------------------------------------------
+void __fastcall TForm1::AppStart( TMessage &Message )
+{
+	Application->ProcessMessages();
+OutputDebugString("Here");
+	if( FindCmdLineSwitch("ResetLinks"))
+	{
+OutputDebugString("Resetting Links");
+		BtnGetStatus->Click();
+		ResetLinks();
+		Close();
+	}
+
+}
+//---------------------------------------------------------------------------
+// User presses the Get Status button
+//---------------------------------------------------------------------------
+void __fastcall TForm1::BtnGetStatusClick(TObject *Sender)
+{
+	IdHTTP->Disconnect();
+	// Get the status of the switches
+	ClearStatus();
+	GetStatus();
+}
+//---------------------------------------------------------------------------
+//---------------------------------------------------------------------------
+bool __fastcall TForm1::SetUpHTTP()
+{
+	try
+	{
+	// This doesn't really matter
+	IdHTTP->AllowCookies = true;
+	//These do matter
+	IdHTTP->Request->BasicAuthentication = true;
+	IdHTTP->Request->Username = "admin";
+	IdHTTP->Request->Password = EdtPassword->Text;
+	IdHTTP->ConnectTimeout = CONNECT_TIMEOUT;
+	// This overrides the default Mozilla 3 signature which will cause an error
+	IdHTTP->Request->UserAgent = "Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.0; Q312461; .NET CLR 1.0.3705)";
+	IdHTTP->HandleRedirects = true;	// Prevents the 302 error because of redirection
+	}
+	catch(Exception &E)
+	{
+		Application->ShowException(&E);
+		return false;
+	}
+	return true;
+}
+//---------------------------------------------------------------------------
+// Gets the status and names of the switches
+//---------------------------------------------------------------------------
+void __fastcall TForm1::GetStatus()
+{
+	// Check for a password
+	if(EdtPassword->Text.Length() < 1)
+	{
+		MessageDlg("Please enter a password.", mtError, TMsgDlgButtons() << mbOK, 0);
+		EdtPassword->SetFocus();
+		return;
+	}
+	TGeneral_RAII_HourGlass hourGlass;
+	// Set up authentication
+	if(!SetUpHTTP())
+		return;
+	// Login and get the web page
+	try
+	{
+//		// We're authorized now
+//		AnsiString S = AnsiString("http://")+EdtURL->Text+":"+EdtPort->Text+AnsiString("/");
+		// Get the page
+		AnsiString S = AnsiString("http://")+EdtURL->Text+":"+EdtPort->Text+AnsiString("/index.htm");
+		AnsiString Resp = IdHTTP->Get(S);
+//OutputDebugString(S.c_str());
+//ShowMessage(Resp);
+		// Remove newline characters for compatability between EPCR and LPC
+		while(Resp.Pos("\n"))
+			Resp.Delete(Resp.Pos("\n"),1);
+		UpdateStatus(Resp);
+		EpcType = epcUNKNOWN;
+		if(Resp.Pos("href=outlet?1=OFF") || Resp.Pos("href=outlet?1=ON"))
+			EpcType = epcLPC;
+		if(Resp.Pos("outletoff?1") || Resp.Pos("outleton?1"))
+			EpcType = epcEPCR;
+		if(Resp.Pos("bgcolor=\"#ddccdd\">Bus A:"))
+			EpcType = epcEPCR2;
+	}
+	catch(Exception &E)
+	{
+		IdHTTP->Disconnect();
+		// Delete the Authentication
+		if(IdHTTP->Request->Authentication)
+		{
+			delete IdHTTP->Request->Authentication;
+			IdHTTP->Request->Authentication = NULL;
+		}
+		Application->ShowException(&E);
+		return;
+	}
+	IdHTTP->Disconnect();
+	if(EpcType == epcLPC || EpcType == epcEPCR || EpcType == epcEPCR2)
+		BtnResetNames->Enabled = true;
+	else
+		BtnResetNames->Enabled = false;
+	BtnAllOn->Enabled = BtnResetNames->Enabled;
+	BtnAllOff->Enabled = BtnResetNames->Enabled;
+	if(EpcType == epcLPC || EpcType == epcEPCR2)
+	{
+		BtnResetAll->Enabled = BtnResetNames->Enabled;
+	}
+	switch(EpcType)
+	{
+	case epcUNKNOWN:
+		LblEpcType->Caption = "Unknown Controller Type";
+		break;
+	case epcLPC:
+		LblEpcType->Caption = "LPC Power Controller";
+		break;
+	case epcEPCR:
+		LblEpcType->Caption = "EPCR (PC8000) Power Controller";
+		break;
+	case epcEPCR2:
+		LblEpcType->Caption = "EPCR2 Power Controller";
+		break;
+	}
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::DisableButtons()
+{
+	BtnResetAll->Enabled = false;
+	BtnResetNames->Enabled = false;
+	BtnAllOn->Enabled = false;
+	BtnAllOff->Enabled = false;
+}
+//---------------------------------------------------------------------------
+// Clear the status if we don't know anything
+//---------------------------------------------------------------------------
+void __fastcall TForm1::ClearStatus()
+{
+	EpcType = epcUNKNOWN;
+	DisableButtons();
+	TSpeedButton* Bp;
+	TLabel* Lb;
+	// Look through all of the components to find what we need
+	for(int i = 0; i < Form1->ComponentCount; ++i)
+	{
+		Bp = dynamic_cast<TSpeedButton*>(Form1->Components[i]);	 // For the buttons
+		Lb = dynamic_cast<TLabel*>(Form1->Components[i]);				 // For the switch names
+		// We have a label
+		if(Lb)
+		{
+			if(Lb->Name == "LabelControllerName")
+				Lb->Caption = "Unknown";
+			for(int i = 1; i < 9; ++i) // Set the names of the switches
+			{
+				AnsiString S = "Label"+IntToStr(i);
+				if(Lb->Name == S)	// Assign default names
+					Lb->Caption = "Switch "+IntToStr(i);
+			}
+		}
+		// We have a switch button
+		if(Bp)
+		{
+			for(int i = 1; i < 9; ++i) // Reset the status of the switches
+			{
+				// Generate the switch button name
+				AnsiString S = "SwitchButton"+IntToStr(i);
+				if(Bp->Name == S)	// If it's the correct button, display the switch status
+				{
+					Bp->Font->Style = Bp->Font->Style << fsBold;
+					Bp->Font->Color = clBlack;
+					Bp->Caption = "?";
+				}
+			}
+		}
+	}
+	UpdateCycleStatus();
+}
+//---------------------------------------------------------------------------
+// Make the cycle buttons visible or not
+//---------------------------------------------------------------------------
+void __fastcall TForm1::UpdateCycleStatus()
+{
+	TSpeedButton* Sb, *Cb;
+	for(int i = 0; i < Form1->ComponentCount; ++i)
+	{
+		Sb = dynamic_cast<TSpeedButton*>(Form1->Components[i]);	 // For the buttons
+		// We have a button
+		if(Sb)
+		{
+			for(int i = 1; i < 9; ++i) // Display the status of the switches
+			{
+				// Generate the switch button name
+				AnsiString SbName = "SwitchButton"+IntToStr(i);
+				if(Sb->Name == SbName) // If it's the correct button
+				{
+					for(int j = 0; j < Form1->ComponentCount; ++j)
+					{
+						Cb = dynamic_cast<TSpeedButton*>(Form1->Components[j]);
+						if(Cb)
+						{
+							AnsiString CbName = "CycleButton"+IntToStr(i);
+							if(Cb->Name == CbName) // If it's the correct button
+							{
+								Cb->Width = 50;
+								Cb->Caption = "Cycle";
+								Cb->Enabled = true;
+								Cb->Visible = Sb->Caption == "on" || !Sb->Enabled;
+								if(Cb->Visible && !Sb->Enabled)
+								{
+									Cb->Caption = "Locked";
+									Cb->Enabled = false;
+								}
+							}
+						}
+					}
+				}
+			}
+		}// Sb
+	}
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::UpdateStatus(const AnsiString &Resp)
+{
+	ClearStatus();
+	TSpeedButton* Bp;
+	TLabel* Lb;
+	// Look through all of the components to find what we need
+	for(int i = 0; i < Form1->ComponentCount; ++i)
+	{
+		Bp = dynamic_cast<TSpeedButton*>(Form1->Components[i]);	 // For the buttons
+		Lb = dynamic_cast<TLabel*>(Form1->Components[i]);				 // For the switch names
+		// We have a label
+		if(Lb)
+		{
+			if(Lb->Name == "LabelControllerName")
+			{
+				AnsiString Flag = AnsiString("Controller:");
+				AnsiString Name;
+				if(Resp.Pos(Flag)) // We found it
+				{
+					Name = Resp.SubString(Resp.Pos(Flag)+11, 50);
+					Name = Name.SubString(1, Name.Pos("</th>")-1); // Find the end
+				}
+				Lb->Caption = Trim(Name);
+				continue;
+			}
+			for(int i = 1; i < 9; ++i) // Get the names of the switches
+			{
+				// This text is before the switch namke on the web page
+				AnsiString Flag = AnsiString("ter>")+IntToStr(i)+"</td><td>";
+				AnsiString Name;
+				if(Resp.Pos(Flag)) // We found it
+				{
+					Name = Resp.SubString(Resp.Pos(Flag)+14, 50);
+					Name = Name.SubString(1, Name.Pos("</t")-1); // Find the end
+					if(Name.Length() > 27)	// Trim it if it's too long
+						Name.c_str()[27] = 0;
+				}
+				// Generate the name of the label
+				AnsiString S = "Label"+IntToStr(i);
+				if(Lb->Name == S)	// Assign the switch name to the appropriate label caption
+					Lb->Caption = Name;
+			}
+		}
+
+		// We have a switch button
+		if(Bp)
+		{
+			for(int i = 1; i < 9; ++i) // Display the status of the switches
+			{
+				// Generate the switch button name
+				AnsiString S = "SwitchButton"+IntToStr(i);
+				if(Bp->Name == S)	// If it's the correct button, display the switch status
+				{
+					Bp->Font->Style = Bp->Font->Style << fsBold;
+					Bp->Font->Color = clBlack;
+					Bp->Enabled = true;
+					if(Resp.Pos("outletoff?"+IntToStr(i)) || Resp.Pos("href=outlet?"+IntToStr(i)+"=OFF"))
+					{
+						Bp->Font->Color = clGreen;
+						Bp->Caption = "on";
+					}
+					if(Resp.Pos("outleton?"+IntToStr(i)) || Resp.Pos("href=outlet?"+IntToStr(i)+"=ON"))
+					{
+						Bp->Font->Color = clRed;
+						Bp->Caption = "off";
+					}
+					// Get lock status on EPCR2
+					int pos = Resp.Pos("href=outlet?"+IntToStr(i)) -30;
+					AnsiString SS = Resp.SubString(pos, Resp.Length() - pos);
+					pos = SS.Pos("LOCKED");
+					if(pos > 0 && pos < 20)
+						Bp->Enabled = false;
+				}
+			}
+		}// Bp
+	}
+	UpdateCycleStatus();
+}
+//---------------------------------------------------------------------------
+// Bye bye...
+//---------------------------------------------------------------------------
+void __fastcall TForm1::BtnExitClick(TObject *Sender)
+{
+	Close();
+}
+//---------------------------------------------------------------------------
+// Save the settings to the registry
+//---------------------------------------------------------------------------
+void __fastcall TForm1::SaveSettings()
+{
+	TRegistry *Reg = new TRegistry();
+	Reg->RootKey = HKEY_CURRENT_USER;
+	try
+	{
+		if(Reg->OpenKey(BASE_KEY,true))
+		{
+			Reg->WriteString("URL", EdtURL->Text);
+			Reg->WriteString("Port", EdtPort->Text);
+#ifdef SAVE_PASSWORD
+			Reg->WriteString("Pass", EdtPassword->Text);
+#endif
+		}
+	}
+	catch(Exception &E)
+	{
+		Application->ShowException(&E);
+	}
+	delete Reg;
+}
+//---------------------------------------------------------------------------
+// Load the settings from the registry
+//---------------------------------------------------------------------------
+void __fastcall TForm1::LoadSettings()
+{
+	TRegistry *Reg = new TRegistry();
+	Reg->RootKey = HKEY_CURRENT_USER;
+	try
+	{
+		if(Reg->OpenKey(BASE_KEY,true))
+		{
+			EdtURL->Text = Reg->ReadString("URL");
+			EdtPort->Text = Reg->ReadString("Port");
+#ifdef SAVE_PASSWORD
+			EdtPassword->Text = Reg->ReadString("Pass");
+			IdHTTP->Request->Password = EdtPassword->Text;
+#endif
+		}
+	}
+	catch(Exception &E)
+	{
+		Application->ShowException(&E);
+	}
+	delete Reg;
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::ResetPowerRecovery()
+{
+	TGeneral_RAII_HourGlass hourGlass;
+	TStringList *PostData = new TStringList;
+	try
+	{
+		PostData->Add("recmode=0");
+		try
+		{
+			IdHTTP->Post("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/powloss.cgi"), PostData);
+		}
+		catch(const Exception &e)
+		{
+			ShowMessage("Error encountered during POST: " + e.Message);
+		}
+	}
+	__finally
+	{
+		delete PostData;
+	}
+	::Sleep(500);
+	Application->ProcessMessages();
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::ResetLinks()
+{
+	TGeneral_RAII_HourGlass hourGlass;
+	TStringList *PostData = new TStringList;
+	try
+	{
+
+		switch(EpcType)
+		{
+		case epcEPCR2:
+			PostData->Add("lnkhref1=http://www.digital-loggers.com/1.html");
+			PostData->Add("lnkdesc1=Manual");
+			PostData->Add("lnkhref2=http://www.digital-loggers.com/2.html");
+			PostData->Add("lnkdesc2=FAQS");
+			PostData->Add("lnkhref3=http://www.digital-loggers.com/3.html");
+			PostData->Add("lnkdesc3=Product Information");
+			PostData->Add("lnkhref4=http://www.digital-loggers.com");
+			PostData->Add("lnkdesc4=Digital Loggers, Inc.");
+			break;
+		case epcLPC:
+			PostData->Add("lnkhref1=http://www.digital-loggers.com/5.html");
+			PostData->Add("lnkdesc1=Manual");
+			PostData->Add("lnkhref2=http://www.digital-loggers.com/6.html");
+			PostData->Add("lnkdesc2=FAQS");
+			PostData->Add("lnkhref3=http://www.digital-loggers.com/7.html");
+			PostData->Add("lnkdesc3=Product Information");
+			PostData->Add("lnkhref4=http://www.digital-loggers.com");
+			PostData->Add("lnkdesc4=Digital Loggers, Inc.");
+			break;
+
+		default:
+			PostData->Add("lnkhref1=http://www.digital-loggers.com");
+			PostData->Add("lnkdesc1=Link 1");
+			PostData->Add("lnkhref2=http://www.digital-loggers.com");
+			PostData->Add("lnkdesc2=Link 2");
+			PostData->Add("lnkhref3=http://www.digital-loggers.com");
+			PostData->Add("lnkdesc3=Link 3");
+			PostData->Add("lnkhref4=http://www.digital-loggers.com");
+			PostData->Add("lnkdesc4=Link 4");
+			break;
+		}
+
+
+
+
+		try
+		{
+			IdHTTP->Post("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/userlinks.cgi"), PostData);
+		}
+		catch(const Exception &e)
+		{
+			ShowMessage("Error encountered during POST: " + e.Message);
+		}
+	}__finally
+	{
+		delete PostData;
+	}
+	::Sleep(500);
+	Application->ProcessMessages();
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::ResetDelay()
+{
+	TGeneral_RAII_HourGlass hourGlass;
+	TStringList *PostData = new TStringList;
+	try
+	{
+		PostData->Add("lockdel=3");
+		PostData->Add("seqdelay=10");
+		PostData->Add("refdelay=5");
+		PostData->Add("refresh=checked");
+		try
+		{
+			IdHTTP->Post("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/delay.cgi"), PostData);
+		}
+		catch(const Exception &e)
+		{
+			ShowMessage("Error encountered during POST: " + e.Message);
+		}
+	}__finally
+	{
+		delete PostData;
+	}
+
+	::Sleep(500);
+	Application->ProcessMessages();
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::ResetNetwork()
+{
+	TGeneral_RAII_HourGlass hourGlass;
+	TStringList *PostData = new TStringList;
+//  TIdMultiPartFormDataStream *PostData = new TIdMultiPartFormDataStream;
+	try
+	{
+/*		PostData->AddFormField("httport","80");
+		PostData->AddFormField("ipaddr","192.168.0.100");
+		PostData->AddFormField("netmask","255.255.255.0");
+		PostData->AddFormField("gateway","192.168.1.1");
+		PostData->AddFormField("samenet","");
+*/
+		PostData->Add("httport=80");
+		PostData->Add("ipaddr=192.168.0.100");
+		PostData->Add("netmask=255.255.255.0");
+		PostData->Add("gateway=192.168.0.1");
+		PostData->Add("samenet=checked");	// comment out this line for unhecked
+		PostData->Add("syslog=0.0.0.0");
+		try
+		{
+			IdHTTP->Post("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/network.cgi"), PostData);
+		}
+		catch(const Exception &e)
+		{
+			ShowMessage("Error encountered during POST: " + e.Message);
+		}
+	}
+	__finally
+	{
+		delete PostData;
+	}
+	::Sleep(500);
+	Application->ProcessMessages();
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::ResetOutletNames()
+{
+	TGeneral_RAII_HourGlass hourGlass;
+	TStringList *PostData = new TStringList;
+	// LPC version
+	if(EpcType == epcLPC || EpcType == epcEPCR2)
+	{
+		try
+		{
+			if(EpcType == epcLPC)
+				PostData->Add("ctrlname=Lite Power Controller");
+			else
+				PostData->Add("ctrlname=EPCR2 Power Controller");
+			PostData->Add("outname1=Outlet 1");
+			PostData->Add("outname2=Outlet 2");
+			PostData->Add("outname3=Outlet 3");
+			PostData->Add("outname4=Outlet 4");
+			PostData->Add("outname5=Outlet 5");
+			PostData->Add("outname6=Outlet 6");
+			PostData->Add("outname7=Outlet 7");
+			PostData->Add("outname8=Outlet 8");
+			try
+			{
+				IdHTTP->Post("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/unitnames.cgi"), PostData);
+			}
+			catch(const Exception &e)
+			{
+				ShowMessage("Error encountered during POST: " + e.Message);
+			}
+		}
+		__finally
+		{
+			delete PostData;
+		}
+	}
+	// EPCR Version
+	if(EpcType == epcEPCR)
+	{
+		try
+		{
+			PostData->Add("formname=unitnames");
+			PostData->Add("ctrlname=DLI Power Controller");
+			PostData->Add("out1name=Outlet 1 - Bus A");
+			PostData->Add("out2name=Outlet 2 - Bus A");
+			PostData->Add("out3name=Outlet 3 - Bus A");
+			PostData->Add("out4name=Outlet 4 - Bus A");
+			PostData->Add("out5name=Outlet 5 - Bus B");
+			PostData->Add("out6name=Outlet 6 - Bus B");
+			PostData->Add("out7name=Outlet 7 - Bus B");
+			PostData->Add("out8name=Outlet 8 - Bus B");
+			try
+			{
+				IdHTTP->Post("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/submit.cgi"), PostData);
+			}
+			catch(const Exception &e)
+			{
+				ShowMessage("Error encountered during POST: " + e.Message);
+			}
+		}
+		__finally
+		{
+			delete PostData;
+		}
+	}
+	::Sleep(500);
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::BtnResetNamesClick(TObject *Sender)
+{
+	if(MessageDlg("Reset all outlet names and links to default?", mtWarning, TMsgDlgButtons() << mbYes<<mbNo, 0) == mrYes)
+	{
+		ResetOutletNames();
+		ResetLinks();
+		GetStatus();
+	}
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::AllOn()
+{
+	TGeneral_RAII_HourGlass hourGlass;
+	if(EpcType == epcLPC || EpcType == epcEPCR2)
+		IdHTTP->Get("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/outlet?a=ON"));
+	if(EpcType == epcEPCR)
+		IdHTTP->Get("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/outleton?a="));
+	::Sleep(1000);
+	GetStatus();
+	::Sleep(2000);
+	GetStatus();
+	Application->ProcessMessages();
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::AllOff()
+{
+	TGeneral_RAII_HourGlass hourGlass;
+	if(EpcType == epcLPC || EpcType == epcEPCR2)
+		IdHTTP->Get("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/outlet?a=OFF"));
+	if(EpcType == epcEPCR)
+		IdHTTP->Get("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/outletoff?a="));
+	::Sleep(250);
+	Application->ProcessMessages();
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::BtnAllOnClick(TObject *Sender)
+{
+	AllOn();
+	GetStatus();
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::BtnAllOffClick(TObject *Sender)
+{
+	AllOff();
+	GetStatus();
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::SwitchButtonClick(TObject *Sender)
+{
+	// Don't let them click-click-click too fast
+	if(Screen->Cursor == crHourGlass)
+		return;
+	TGeneral_RAII_HourGlass hourGlass;
+	// When the switch button
+	TSpeedButton* Bp;
+	Bp = dynamic_cast<TSpeedButton*>(Sender);
+	if(Bp)
+	{
+		if(Bp->Caption.Pos("unknown"))
+		{
+			MessageDlg("You must successfully obtain the status first.", mtError, TMsgDlgButtons() << mbOK, 0);
+			return;
+		}
+		try
+		{
+			AnsiString S = "http://"+EdtURL->Text+":"+EdtPort->Text+"/outlet";
+			if(EpcType == epcEPCR)
+			{
+				if(Bp->Caption.Pos("on"))
+					S = S + "off?"+IntToStr(Bp->Tag);
+				else
+					S	= S + "on?"+IntToStr(Bp->Tag);
+			}
+			else
+			{
+				S = "http://"+EdtURL->Text+":"+EdtPort->Text+"/outlet?";
+				if(Bp->Caption.Pos("on"))
+					S = S+IntToStr(Bp->Tag)+AnsiString("=OFF");
+				else
+					S	= S+IntToStr(Bp->Tag)+AnsiString("=ON");
+			}
+			IdHTTP->Get(S);
+			::Sleep(500);
+			GetStatus();
+		}
+		catch(Exception &E)
+		{
+			IdHTTP->Disconnect();
+			Application->ShowException(&E);
+		}
+		IdHTTP->Disconnect();
+	}
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::BtnResetAllClick(TObject *Sender)
+{
+	if(MessageDlg("Reset all settings to default?", mtWarning, TMsgDlgButtons() << mbYes<<mbNo, 0) == mrYes)
+	{
+		TGeneral_RAII_HourGlass hourGlass;
+		DisableButtons();
+		ResetOutletNames();
+		ResetPowerRecovery();
+		ResetLinks();
+		ResetDelay();
+		ResetNetwork();
+		IdHTTP->Disconnect();
+		::Sleep(2000);
+		ClearStatus();
+	}
+	Application->ProcessMessages();
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::CycleButtonClick(TObject *Sender)
+{
+	// Don't let them click-click-click too fast
+	if(Screen->Cursor == crHourGlass)
+		return;
+	TGeneral_RAII_HourGlass hourGlass;
+	// When the switch button
+	TSpeedButton* CycleButton;
+	CycleButton = dynamic_cast<TSpeedButton*>(Sender);
+	if(CycleButton)
+	{
+		try
+		{
+			AnsiString S = "http://"+EdtURL->Text+":"+EdtPort->Text+"/outlet";
+			if(EpcType == epcLPC || EpcType == epcEPCR2)
+				S = "http://"+EdtURL->Text+":"+EdtPort->Text+"/outlet?"+IntToStr(CycleButton->Tag)+AnsiString("=CCL");
+			if(EpcType == epcEPCR)
+				S = "http://"+EdtURL->Text+":"+EdtPort->Text+"/outletgl?"+IntToStr(CycleButton->Tag);
+			IdHTTP->Get(S);
+			::Sleep(1000);
+			GetStatus();
+			::Sleep(2000);
+			GetStatus();
+		}
+		catch(Exception &E)
+		{
+			Application->ShowException(&E);
+		}
+		IdHTTP->Disconnect();
+	}
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::FormClose(TObject *Sender, TCloseAction &Action)
+{
+	IdHTTP->Disconnect();
+	SaveSettings();
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::Button1Click(TObject *Sender)
+{
+	TGeneral_RAII_HourGlass hourGlass;
+	TStringList *PostData = new TStringList;
+//	TStringList *Response = new TStringList;
+//	TMemoryStream *Response = new TMemoryStream;
+
+//  TIdMultiPartFormDataStream *PostData = new TIdMultiPartFormDataStream;
+
+	try
+	{
+//		PostData->AddFormField("httport","80");
+//		PostData->AddFormField("ipaddr","192.168.0.101");
+//		PostData->AddFormField("netmask","255.255.255.0");
+//		PostData->AddFormField("gateway","192.168.0.1");
+//		PostData->AddFormField("samenet","");
+
+		PostData->Add("httport=80");
+		PostData->Add("ipaddr=192.168.0.101");
+		PostData->Add("netmask=255.255.255.0");
+		PostData->Add("gateway=192.168.0.1");
+		PostData->Add("samenet=checked");	// comment out this line for unhecked
+		PostData->Add("syslog=0.0.0.0");
+		try
+		{
+			IdHTTP->Post("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/network.cgi"), PostData);
+//    	IdHTTP->Post("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/network.cgi"), PostData, Response);
+
+		}
+		catch(const Exception &e)
+		{
+			ShowMessage("Error encountered during POST: " + e.Message);
+		}
+	}
+	__finally
+	{
+		delete PostData;
+	}
+
+	::Sleep(500);
+	Application->ProcessMessages();
+}
+//---------------------------------------------------------------------------
+#define USE_STRINGLIST
+void __fastcall TForm1::Button2Click(TObject *Sender)
+{
+	TGeneral_RAII_HourGlass hourGlass;
+
+#ifdef USE_STRINGLIST
+	TStringList *PostData = new TStringList;
+#else
+	TIdMultiPartFormDataStream *PostData = new TIdMultiPartFormDataStream;
+#endif
+
+	// LPC version
+	if(EpcType == epcLPC || EpcType == epcEPCR2)
+	{
+		try
+		{
+#ifdef USE_STRINGLIST
+			PostData->Add("ctrlname=Ethernet Power Controller II");
+			PostData->Add("outname1=Outlet 1");
+			PostData->Add("outname2=Outlet 2");
+			PostData->Add("outname3=Outlet 3");
+			PostData->Add("outname4=Outlet 4");
+			PostData->Add("outname5=Outlet 5");
+			PostData->Add("outname6=Outlet 6");
+			PostData->Add("outname7=Outlet 7");
+			PostData->Add("outname8=Outlet 8");
+#else
+			PostData->AddFormField("ctrlname","Ethernet Power Controller II");
+			PostData->AddFormField("outname1","Outlet 1");
+			PostData->AddFormField("outname2","Outlet 2");
+			PostData->AddFormField("outname3","Outlet 3");
+			PostData->AddFormField("outname4","Outlet 4");
+			PostData->AddFormField("outname5","Outlet 5");
+			PostData->AddFormField("outname6","Outlet 6");
+			PostData->AddFormField("outname7","Outlet 7");
+			PostData->AddFormField("outname8","Outlet 8");
+#endif
+			try
+			{
+#ifdef USE_STRINGLIST
+				IdHTTP->Post("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/unitnames.cgi"), PostData);
+#else
+				IdHTTP->Post("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/unitnames.cgi"), PostData);
+//				IdHTTP->Post("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/unitnames.cgi"), PostData, Response->Strings);
+#endif
+
+			}
+			catch(const Exception &e)
+			{
+				ShowMessage("Error encountered during POST: " + e.Message);
+			}
+		}
+		__finally
+		{
+			delete PostData;
+		}
+	}
+/*
+	// EPCR Version
+	if ( EpcType == epcEPCR )
+	{
+		try
+		{
+			PostData->Add("formname=unitnames");
+			PostData->Add("ctrlname=DLI Power Controller");
+			PostData->Add("out1name=Outlet 1 - Bus A");
+			PostData->Add("out2name=Outlet 2 - Bus A");
+			PostData->Add("out3name=Outlet 3 - Bus A");
+			PostData->Add("out4name=Outlet 4 - Bus A");
+			PostData->Add("out5name=Outlet 5 - Bus B");
+			PostData->Add("out6name=Outlet 6 - Bus B");
+			PostData->Add("out7name=Outlet 7 - Bus B");
+			PostData->Add("out8name=Outlet 8 - Bus B");
+			try
+			{
+				IdHTTP->Post("http://"+EdtURL->Text+":"+EdtPort->Text+AnsiString("/submit.cgi"), PostData);
+			}
+			catch ( const Exception &e )
+			{
+				ShowMessage("Error encountered during POST: " + e.Message);
+			}
+		}
+		__finally
+		{
+			delete PostData;
+		}
+	}
+*/
+	::Sleep(500);
+}
+//---------------------------------------------------------------------------
+
+
